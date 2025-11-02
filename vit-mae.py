@@ -1,3 +1,9 @@
+from typing import Any
+
+
+from typing import Any
+
+
 import torch, torch.nn as nn
 from torch import Tensor
 
@@ -34,23 +40,23 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.down_projection(self.activation(self.up_projection(x)))
 
-class MHSA(nn.Module):
-    def __init__(self, d, heads=8):
+class MHSA(nn.Module): # multi-head self-attention
+    def __init__(self, embedd_dim, heads=8):
         super().__init__()
         self.heads = heads
-        self.dim_per_head = d // heads
-        self.qkv_projection = nn.Linear(d, d*3)
-        self.output_projection = nn.Linear(d, d)
+        self.dim_per_head = embedd_dim // heads
+        self.qkv_projection = nn.Linear(embedd_dim, embedd_dim*3)
+        self.output_projection = nn.Linear(embedd_dim, embedd_dim)
 
     def forward(self, x):
-        B, N, D = x.shape
+        batch_size, num_patches, embedd_dim = x.shape
         q, k, v = self.qkv_projection(x).chunk(3, dim=-1)
-        def reshape(t):  # [B, N, heads, dim_per_head]
-            return t.view(B, N, self.heads, self.dim_per_head).transpose(1, 2)
-        q, k, v = map(reshape, (q, k, v))
-        attn = (q @ k.transpose(-2, -1)) / (self.dim_per_head ** 0.5)
-        attn = attn.softmax(dim=-1)
-        out = (attn @ v).transpose(1, 2).reshape(B, N, D)
+        def reshape(t): # use to split q,k,v into heads
+            return t.view(batch_size, num_patches, self.heads, self.dim_per_head).transpose(1, 2) # [batch_size, heads, num_patches, dim_per_head]
+        q, k, v = map[Any](reshape, (q, k, v))
+        attn = (q @ k.transpose(-2, -1)) / (self.dim_per_head ** 0.5) # compute attention scores
+        attn = attn.softmax(dim=-1) # softmax over the last dimension (rows) to get attention weights. each row is a token's attention weights to all other tokens.
+        out = (attn @ v).transpose(1, 2).reshape(batch_size, num_patches, embedd_dim)
         return self.output_projection(out)
 
 class TransformerBlock(nn.Module):
