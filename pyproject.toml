@@ -1,0 +1,14 @@
+[project]
+name = "vit-mae"
+version = "0.1.0"
+description = "Vision Transformer Masked Autoencoder (ViT-MAE) implementation"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.21.0",
+    "torch>=1.9.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
