@@ -71,6 +71,8 @@ celerybeat.pid
 # SageMath
 *.sage.py
 
+datasets/
+
 # Environments
 .env
 .venv

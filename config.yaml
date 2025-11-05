@@ -1,0 +1,50 @@
+datasets:
+- name: "Public_Blastocyst_Dataset"
+  path: "datasets/all_public_blastocyst_datasets/Public_Blastocyst_Dataset/Images"
+  structure: "nested"  
+  split_ratio: 0.8  # 80% train, 20% val
+  
+# - name: "Public_ED_Blastocyst"
+#   path: "datasets/all_public_blastocyst_datasets/Public_ED_Blastocyst/Images"
+#   structure: "nested"  
+#   split_ratio: 0.8
+  
+# - name: "Public_EmbryosFormer_Dataset"
+#   path: "datasets/all_public_blastocyst_datasets/Public_EmbryosFormer_Dataset/Images"
+#   structure: "csv"  
+#   annotations_path: "datasets/all_public_blastocyst_datasets/Public_EmbryosFormer_Dataset/annotations"
+
+# training configuration
+training:
+  img_size: 224
+  batch_size: 8
+  num_workers: 2
+  seed: 42
+  num_epochs: 10
+  learning_rate: 1e-4
+  mask_ratio: 0.75 
+  
+  # validation configuration
+  validation:
+    frequency: "epoch"  # possible values: "epoch" or "step"
+    every_n_epochs: 1  # validate every N epochs (default: 1)
+    every_n_steps: null  # validate every N steps (default: null)
+  
+  # checkpoint configuration
+  checkpoint:
+    save_best: true  # save best model based on val_loss
+    save_every_n_epochs: 1  # save checkpoint every N epochs
+    save_every_n_steps: 100  # save checkpoint every N steps (for long training)
+    keep_last_n: 2  # keep only last N checkpoints to save disk space
+  
+  # early stopping configuration
+  early_stopping:
+    patience: 5  # stop after N epochs without improvement
+    min_delta: 0.0  # minimum change to qualify as improvement
+  
+  # learning rate scheduler configuration
+  scheduler:
+    type: "CosineAnnealingWarmRestarts"  # Options: CosineAnnealingWarmRestarts, CosineAnnealingLR, StepLR, etc.
+    T_0: 10  # number of iterations for the first restart
+    T_mult: 2  # factor increases T_i after a restart
+    eta_min: 1e-6  # minimum learning rate
