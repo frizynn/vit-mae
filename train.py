@@ -9,7 +9,6 @@ import random
 import logging
 import os
 from pathlib import Path
-from collections import deque
 from data_loader import load_datasets_from_config
 
 logging.basicConfig(
@@ -24,7 +23,7 @@ def train_epoch(model, train_loader, optimizer, device, global_step=0,
                 validation_frequency='epoch', every_n_steps=None,
                 save_every_n_steps=None, checkpoint_dir=None, 
                 epoch_num=0, save_checkpoint_func=None, 
-                best_val_loss=None, save_best=False):
+                best_val_loss=None, save_best=False, best_checkpoint_path=None, min_delta=0.0):
     """train for one epoch with optional validation and checkpointing by steps"""
     model.train()
     total_loss = 0
@@ -40,7 +39,7 @@ def train_epoch(model, train_loader, optimizer, device, global_step=0,
         reconstructed_patches, target_patches, mask_indices = model(images)
         
         # compute loss only on masked patches
-        loss = mae_loss(reconstructed_patches, target_patches, mask_indices)
+        loss = mae_loss(reconstructed_patches, target_patches, mask_indices, norm_pix_loss=model.norm_pix_loss)
         
         # backward pass
         optimizer.zero_grad()
@@ -55,12 +54,14 @@ def train_epoch(model, train_loader, optimizer, device, global_step=0,
             logger.info(f"Batch {batch_idx + 1}/{len(train_loader)}, Step {current_step}, Loss: {loss.item():.4f}")
         
         # Validate by step if configured
+        current_val_loss = None
         if validation_frequency == 'step' and every_n_steps is not None and validate_func is not None:
             if current_step - last_step_validation >= every_n_steps:
                 logger.info(f"Validating at step {current_step}...")
                 val_loss = validate_func(model, val_loader, device)
                 logger.info(f"Val Loss at step {current_step}: {val_loss:.4f}")
                 last_step_validation = current_step
+                current_val_loss = val_loss
                 
                 # Save best model if validation improved
                 if save_best and best_val_loss is not None and val_loss < best_val_loss[0]:
@@ -68,18 +69,40 @@ def train_epoch(model, train_loader, optimizer, device, global_step=0,
                     best_model_path = checkpoint_dir / "vit_mae_best.pth"
                     torch.save(model.state_dict(), best_model_path)
                     logger.info(f"Best model saved at step {current_step} (val_loss: {val_loss:.4f})")
+                
+                # Save checkpoint if validation improved (only when we have validation)
+                if save_every_n_steps is not None and save_checkpoint_func is not None:
+                    current_avg_loss = total_loss / num_batches if num_batches > 0 else 0
+                    was_saved, new_path, new_loss = save_checkpoint_func(
+                        model, optimizer, scheduler, epoch_num + 1, current_step,
+                        current_avg_loss, val_loss, checkpoint_dir,
+                        best_checkpoint_path[0] if best_checkpoint_path is not None else None, min_delta
+                    )
+                    if was_saved:
+                        if best_checkpoint_path is not None:
+                            best_checkpoint_path[0] = new_path
+                        if best_val_loss is not None:
+                            best_val_loss[0] = new_loss
         
-        # Save checkpoint by step if configured
-        if save_every_n_steps is not None and save_checkpoint_func is not None:
-            if current_step - last_step_checkpoint >= save_every_n_steps:
-                checkpoint_path = checkpoint_dir / f"checkpoint_step_{current_step}.pth"
-                # Get current average loss for checkpoint
-                current_avg_loss = total_loss / num_batches if num_batches > 0 else 0
-                val_loss_for_checkpoint = best_val_loss[0] if best_val_loss is not None else float('inf')
-                save_checkpoint_func(model, optimizer, scheduler, epoch_num + 1, current_step, 
-                                   current_avg_loss, val_loss_for_checkpoint, checkpoint_path)
-                logger.info(f"Step checkpoint saved at step {current_step}: {checkpoint_path}")
-                last_step_checkpoint = current_step
+      
+        if (save_every_n_steps is not None and save_checkpoint_func is not None and 
+            validation_frequency != 'step' and current_step - last_step_checkpoint >= save_every_n_steps):
+            # Get current average loss for checkpoint
+            current_avg_loss = total_loss / num_batches if num_batches > 0 else 0
+            # Use best val_loss if available, otherwise use inf (won't save unless it's better)
+            val_loss_for_checkpoint = best_val_loss[0] if best_val_loss is not None else float('inf')
+            if save_checkpoint_func is not None:
+                was_saved, new_path, new_loss = save_checkpoint_func(
+                    model, optimizer, scheduler, epoch_num + 1, current_step,
+                    current_avg_loss, val_loss_for_checkpoint, checkpoint_dir,
+                    best_checkpoint_path[0] if best_checkpoint_path is not None else None, min_delta
+                )
+                if was_saved:
+                    if best_checkpoint_path is not None:
+                        best_checkpoint_path[0] = new_path
+                    if best_val_loss is not None:
+                        best_val_loss[0] = new_loss
+            last_step_checkpoint = current_step
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0
     return avg_loss, current_step
@@ -117,27 +140,49 @@ def save_checkpoint(model, optimizer, scheduler, epoch, step, train_loss, val_lo
         'val_loss': val_loss,
     }, checkpoint_path)
 
-def cleanup_old_checkpoints(checkpoint_dir, keep_last_n, prefix='checkpoint_'):
-    """Remove old checkpoints, keeping only the last N (by modification time)"""
+def save_best_checkpoint(model, optimizer, scheduler, epoch, step, train_loss, val_loss, 
+                         checkpoint_dir, best_checkpoint_path, min_delta=0.0):
+    """
+    Save checkpoint only if val_loss is better than the previous best checkpoint.
+    Deletes the previous best checkpoint if a new one is saved.
+    
+    Returns:
+        tuple: (was_saved, new_best_checkpoint_path, new_best_val_loss)
+    """
     checkpoint_dir = Path(checkpoint_dir)
-    if not checkpoint_dir.exists():
-        return
+    checkpoint_dir.mkdir(exist_ok=True)
     
-    # Get all checkpoint files matching the prefix (excluding best and final models)
-    all_checkpoints = list(checkpoint_dir.glob(f"{prefix}*.pth"))
-    # Exclude best and final models from cleanup
-    checkpoints = [c for c in all_checkpoints if 'best' not in c.name and 'final' not in c.name]
+    # If no previous best checkpoint exists, save this one
+    if best_checkpoint_path is None or not best_checkpoint_path.exists():
+        checkpoint_path = checkpoint_dir / "checkpoint_best.pth"
+        save_checkpoint(model, optimizer, scheduler, epoch, step, train_loss, val_loss, checkpoint_path)
+        logger.info(f"Best checkpoint saved: {checkpoint_path} (val_loss: {val_loss:.4f})")
+        return True, checkpoint_path, val_loss
     
-    if len(checkpoints) <= keep_last_n:
-        return
+    # Load previous best checkpoint to compare val_loss
+    try:
+        prev_checkpoint = torch.load(best_checkpoint_path, map_location='cpu')
+        prev_val_loss = prev_checkpoint.get('val_loss', float('inf'))
+    except Exception as e:
+        logger.warning(f"Could not load previous checkpoint {best_checkpoint_path}: {e}. Saving new checkpoint.")
+        checkpoint_path = checkpoint_dir / "checkpoint_best.pth"
+        save_checkpoint(model, optimizer, scheduler, epoch, step, train_loss, val_loss, checkpoint_path)
+        return True, checkpoint_path, val_loss
     
-    # Sort by modification time (newest first)
-    checkpoints = sorted(checkpoints, key=lambda x: x.stat().st_mtime, reverse=True)
-    
-    # Keep only the last N checkpoints, remove the rest
-    for old_checkpoint in checkpoints[keep_last_n:]:
-        old_checkpoint.unlink()
-        logger.info(f"Removed old checkpoint: {old_checkpoint}")
+    # Check if current loss is better (lower) than previous best
+    if val_loss < prev_val_loss - min_delta:
+        # Delete previous best checkpoint
+        best_checkpoint_path.unlink()
+        logger.info(f"Removed previous best checkpoint (val_loss: {prev_val_loss:.4f})")
+        
+        # Save new best checkpoint
+        checkpoint_path = checkpoint_dir / "checkpoint_best.pth"
+        save_checkpoint(model, optimizer, scheduler, epoch, step, train_loss, val_loss, checkpoint_path)
+        logger.info(f"Best checkpoint saved: {checkpoint_path} (val_loss: {val_loss:.4f}, prev: {prev_val_loss:.4f})")
+        return True, checkpoint_path, val_loss
+    else:
+        logger.debug(f"Checkpoint not saved (val_loss: {val_loss:.4f} >= best: {prev_val_loss:.4f})")
+        return False, best_checkpoint_path, prev_val_loss
 
 def main():
     # load config
@@ -179,6 +224,18 @@ def main():
     T_mult = int(scheduler_config.get('T_mult', 2))
     eta_min = float(scheduler_config.get('eta_min', 1e-6))
     
+    # model architecture configuration
+    model_config = training_config.get('model', {})
+    patch_size = model_config.get('patch_size', 16)
+    channels = model_config.get('channels', 3)
+    d_e = model_config.get('d_e', 1024)
+    d_decoder = model_config.get('d_decoder', 512)
+    encoder_depth = model_config.get('encoder_depth', 12)
+    decoder_depth = model_config.get('decoder_depth', 8)
+    encoder_heads = model_config.get('encoder_heads', 16)
+    decoder_heads = model_config.get('decoder_heads', 8)
+    norm_pix_loss = model_config.get('norm_pix_loss', True)
+    
     # set seed for reproducibility
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -187,7 +244,6 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     
-    patch_size = 16
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     logger.info(f"Using device: {device}")
@@ -197,15 +253,21 @@ def main():
     logger.info(f"Learning rate: {learning_rate}")
     logger.info(f"Number of epochs: {num_epochs}")
     logger.info(f"Mask ratio: {mask_ratio} (keep ratio: {keep_ratio})")
+    logger.info(f"Model architecture:")
+    logger.info(f"  Patch size: {patch_size}")
+    logger.info(f"  Channels: {channels}")
+    logger.info(f"  Encoder: d_e={d_e}, depth={encoder_depth}, heads={encoder_heads}")
+    logger.info(f"  Decoder: d_decoder={d_decoder}, depth={decoder_depth}, heads={decoder_heads}")
+    logger.info(f"  Norm pix loss: {norm_pix_loss} (per-patch normalization)")
     logger.info(f"Scheduler: {scheduler_type} (T_0={T_0}, T_mult={T_mult}, eta_min={eta_min})")
     logger.info(f"Validation: frequency={validation_frequency}, every_n_epochs={every_n_epochs}, every_n_steps={every_n_steps}")
     logger.info(f"Checkpoints: save_best={save_best}, save_every_n_epochs={save_every_n_epochs}, save_every_n_steps={save_every_n_steps}, keep_last_n={keep_last_n}")
     
-    # Create checkpoint directory
+    # create checkpoint directory
     checkpoint_dir = Path("checkpoints")
     checkpoint_dir.mkdir(exist_ok=True)
     
-    # load datasets from config
+    # load datasets
     train_loader, val_loader = load_datasets_from_config(
         config_path='config.yaml',
         img_size=img_size,
@@ -214,24 +276,25 @@ def main():
         seed=seed
     )
     
-    # create model
+    # create ViT-MAE model
     model = ViTMAE(
         img_size=img_size,
         patch_size=patch_size,
-        channels=3,
-        d_e=1024,
-        d_decoder=512,
-        encoder_depth=12,
-        decoder_depth=8,
-        encoder_heads=16,
-        decoder_heads=8,
-        keep_ratio=keep_ratio
+        channels=channels,
+        d_e=d_e,
+        d_decoder=d_decoder,
+        encoder_depth=encoder_depth,
+        decoder_depth=decoder_depth,
+        encoder_heads=encoder_heads,
+        decoder_heads=decoder_heads,
+        keep_ratio=keep_ratio,
+        norm_pix_loss=norm_pix_loss
     ).to(device)
     
-    # optimizer
+    # create optimizer
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.05)
     
-    # learning rate scheduler
+    # create learning rate scheduler
     if scheduler_type == 'CosineAnnealingWarmRestarts':
         scheduler = CosineAnnealingWarmRestarts(
             optimizer=optimizer,
@@ -248,15 +311,27 @@ def main():
             eta_min=eta_min
         )
     
-    # training
+    # start training
     logger.info("Starting training...")
-    best_val_loss = [float('inf')]  # Use list to allow modification in nested function
+    best_val_loss = [float('inf')]  # use list to allow modification in nested function
     global_step = 0
     last_val_loss = None
     epochs_without_improvement = 0
     
-    # Track checkpoint paths for cleanup
-    checkpoint_paths = deque(maxlen=keep_last_n)
+    # Track best checkpoint path (only keep the best one) - use list for mutability
+    best_checkpoint_path_file = checkpoint_dir / "checkpoint_best.pth"
+    if best_checkpoint_path_file.exists():
+        # Load existing best checkpoint to get its val_loss
+        try:
+            existing_checkpoint = torch.load(best_checkpoint_path_file, map_location='cpu')
+            best_val_loss[0] = existing_checkpoint.get('val_loss', float('inf'))
+            logger.info(f"Found existing best checkpoint with val_loss: {best_val_loss[0]:.4f}")
+            best_checkpoint_path = [best_checkpoint_path_file]
+        except Exception as e:
+            logger.warning(f"Could not load existing checkpoint: {e}. Starting fresh.")
+            best_checkpoint_path = [None]
+    else:
+        best_checkpoint_path = [None]
     
     for epoch in range(num_epochs):
         logger.info(f"\n{'='*60}")
@@ -265,7 +340,8 @@ def main():
         
         # Prepare callbacks for step-based validation and checkpointing
         validate_callback = validate_epoch if validation_frequency == 'step' and every_n_steps is not None else None
-        save_checkpoint_callback = save_checkpoint if save_every_n_steps is not None else None
+        # Use save_best_checkpoint for step-based checkpointing
+        save_checkpoint_callback = (save_best_checkpoint if save_every_n_steps is not None else None)
         
         # train with optional step-based validation and checkpointing
         train_loss, global_step = train_epoch(
@@ -280,7 +356,9 @@ def main():
             epoch_num=epoch,
             save_checkpoint_func=save_checkpoint_callback,
             best_val_loss=best_val_loss if save_best else None,
-            save_best=save_best
+            save_best=save_best,
+            best_checkpoint_path=best_checkpoint_path,
+            min_delta=min_delta
         )
         
         # Determine if we should validate by epoch
@@ -322,15 +400,16 @@ def main():
         if patience:
             logger.info(f"  Epochs without improvement: {epochs_without_improvement}/{patience}")
         
-        # Save checkpoint by epoch
+        # Save checkpoint by epoch (only if it's the best loss)
         if (epoch + 1) % save_every_n_epochs == 0:
-            checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch + 1}_step_{global_step}.pth"
-            save_checkpoint(model, optimizer, scheduler, epoch + 1, global_step, train_loss, val_loss, checkpoint_path)
-            checkpoint_paths.append(checkpoint_path)
-            logger.info(f"Checkpoint saved: {checkpoint_path}")
-            
-            # Cleanup old checkpoints
-            cleanup_old_checkpoints(checkpoint_dir, keep_last_n, prefix='checkpoint_')
+            was_saved, new_path, new_loss = save_best_checkpoint(
+                model, optimizer, scheduler, epoch + 1, global_step,
+                train_loss, val_loss, checkpoint_dir, 
+                best_checkpoint_path[0] if best_checkpoint_path is not None else None, min_delta
+            )
+            if was_saved:
+                best_checkpoint_path[0] = new_path
+                best_val_loss[0] = new_loss
     
     logger.info("\nTraining completed!")
     # save final model

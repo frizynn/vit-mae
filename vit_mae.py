@@ -103,8 +103,32 @@ class Decoder(nn.Module):
             decoder_input = block(decoder_input)
         return self.head(decoder_input)                         
 
-def mae_loss(pred, target_patches, mask_idx):
-    return ((pred[:, mask_idx, :] - target_patches[:, mask_idx, :])**2).mean()
+def mae_loss(pred, target_patches, mask_idx, norm_pix_loss=True):
+    """
+    Compute MAE loss on masked patches.
+    
+    Args:
+        pred: predicted patches [batch, num_patches, patch_dim]
+        target_patches: target patches [batch, num_patches, patch_dim]
+        mask_idx: indices of masked patches
+        norm_pix_loss: if True, normalize each patch by its mean and variance (as in MAE paper)
+    
+    Returns:
+        loss value
+    """
+    if norm_pix_loss:
+        
+        target_mean = target_patches[:, mask_idx, :].mean(dim=-1, keepdim=True)
+        target_var = target_patches[:, mask_idx, :].var(dim=-1, keepdim=True, unbiased=False)
+        target_normalized = (target_patches[:, mask_idx, :] - target_mean) / (target_var + 1e-6).sqrt()
+        
+        pred_mean = pred[:, mask_idx, :].mean(dim=-1, keepdim=True)
+        pred_var = pred[:, mask_idx, :].var(dim=-1, keepdim=True, unbiased=False)
+        pred_normalized = (pred[:, mask_idx, :] - pred_mean) / (pred_var + 1e-6).sqrt()
+        
+        return ((pred_normalized - target_normalized) ** 2).mean()
+    else:
+        return ((pred[:, mask_idx, :] - target_patches[:, mask_idx, :])**2).mean()
 
 class ViTMAE(nn.Module):
     """Complete ViT-MAE model combining Encoder and Decoder"""
@@ -112,11 +136,12 @@ class ViTMAE(nn.Module):
                  patch_dim=768, d_e=1024, d_decoder=512, 
                  encoder_depth=12, decoder_depth=8, 
                  encoder_heads=16, decoder_heads=8, 
-                 keep_ratio=0.25):
+                 keep_ratio=0.25, norm_pix_loss=True):
         super().__init__()
         self.patch_size = patch_size
         self.channels = channels
         self.keep_ratio = keep_ratio
+        self.norm_pix_loss = norm_pix_loss
         self.num_patches = (img_size // patch_size) ** 2
         self.patch_dim = patch_size * patch_size * channels
         

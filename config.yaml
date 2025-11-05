@@ -22,7 +22,19 @@ training:
   seed: 42
   num_epochs: 10
   learning_rate: 1e-4
-  mask_ratio: 0.75 
+  mask_ratio: 0.75
+  
+  # model architecture hyperparameters
+  model:
+    patch_size: 16
+    channels: 3
+    d_e: 1024  # encoder embedding dimension
+    d_decoder: 512  # decoder embedding dimension
+    encoder_depth: 12  # number of transformer blocks in encoder
+    decoder_depth: 8  # number of transformer blocks in decoder
+    encoder_heads: 16  # number of attention heads in encoder
+    decoder_heads: 8  # number of attention heads in decoder
+    norm_pix_loss: true  # normalize each patch by its mean and variance (as in MAE paper) 
   
   # validation configuration
   validation:
